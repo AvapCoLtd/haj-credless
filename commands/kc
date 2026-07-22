@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Keycloak の Admin REST API を叩く CLI (glab api と同型)。
+#
+# Usage: haj kc <サブコマンド> [...]
+#   api <METHOD> <path> [json]   Admin REST API 素通し。path は realm 起点
+#       (/admin/realms/<realm>)。GET は即実行。書込 (POST/PUT/DELETE/PATCH) は
+#       --yes を付けたときだけ送信し、無しor --dry-run では送らず内容だけ表示する。
+#       path が /admin/ や /realms/ で始まれば realm 起点を挟まず素通し。
+#   users [<検索>]               ユーザー一覧 (username/email 部分一致。整形表示)
+#   user <username>              1 ユーザーの詳細 (exact 一致) と所属グループ
+#   groups                       グループ一覧 (path / name / id)
+#   clients [<検索>]             クライアント一覧 (clientId / enabled / id)
+#   whoami                       今のトークンの azp と realm-management ロール (疎通確認)
+#   token                        アクセストークンを 1 個発行して表示 (デバッグ用・機微)
+#
+# 認証は service account の client_credentials。kcadm.sh (Java dist) は使わない。
+# client_secret は画面に出さず bao から注入する。優先順:
+#   1) 環境 (haj --secret KC_CLIENT_SECRET=... / export)
+#   2) 宣言 tree.<インストール名>.secret.KC_CLIENT_SECRET から pull (haj 0.34+)
+#   3) bao セッションを確保して KC_BAO_PATH から自動取得
+#
+# 設定値 (実効値は `haj env kc`):
+#   KC_URL          Keycloak のベース URL (旧レイアウトなら /auth 接頭辞込み)。必須
+#   KC_REALM        操作対象 realm (Admin API の /admin/realms/<realm>)
+#   KC_TOKEN_REALM  クライアントが認証する realm (既定は KC_REALM。master のクライアントを借りるときだけ変える)
+#   KC_CLIENT_ID    client_credentials のクライアント ID
+#   KC_BAO_PATH     client_secret を置く bao の kv パス
+#   BAO_ADDR        bao のアドレス (secret の bao フォールバック用)
+#   KC_CLIENT_SECRET は上の優先順で解決する (実効値は表示しない)
+#
+# haj-kc クライアントの作り方・最小ロールは `haj docs credless` を参照。
+set -euo pipefail
+
+KC_URL="${KC_URL:-}"                     # 必須。tree.<インストール名>.env.KC_URL で設定する
+KC_REALM="${KC_REALM:-master}"
+KC_TOKEN_REALM="${KC_TOKEN_REALM:-$KC_REALM}"
+KC_CLIENT_ID="${KC_CLIENT_ID:-haj-kc}"
+KC_BAO_PATH="${KC_BAO_PATH:-}"           # 任意。client_secret を置く bao の kv パス
+
+# haj の規約フック(SPEC §4)。中身の実行はここより下。
+case "${1:-}" in
+  --haj-describe) echo "Keycloak の Admin REST API CLI (client_credentials)"; exit 0 ;;
+  --haj-help)     sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "KC_URL=${KC_URL}" \
+      "KC_REALM=${KC_REALM}" \
+      "KC_TOKEN_REALM=${KC_TOKEN_REALM}" \
+      "KC_CLIENT_ID=${KC_CLIENT_ID}" \
+      "KC_BAO_PATH=${KC_BAO_PATH}" \
+      "BAO_ADDR=${BAO_ADDR:-}" \
+      "# KC_CLIENT_SECRET は環境 > 宣言 tree.${HAJ_TREE:-<インストール名>}.secret.* > KC_BAO_PATH の順で解決 (実効値は表示しない)"
+    exit 0 ;;
+  --haj-complete)
+    shift
+    if [ $# -eq 0 ]; then
+      printf '%s\n' api users user groups clients whoami token
+    else
+      case "$1" in
+        api) [ $# -eq 1 ] && printf '%s\n' GET POST PUT DELETE PATCH ;;
+      esac
+    fi
+    exit 0 ;;
+esac
+
+[ $# -gt 0 ] || exec "$0" --haj-help
+
+if [ -z "$KC_URL" ]; then
+  tree="${HAJ_TREE:-<インストール名>}"
+  echo "kc: KC_URL が未設定です。Keycloak のベース URL を設定してください:" >&2
+  echo "  haj config set tree.${tree}.env.KC_URL https://keycloak.example.com/auth" >&2
+  echo "  (realm 等も同様に: tree.${tree}.env.KC_REALM / KC_TOKEN_REALM / KC_BAO_PATH)" >&2
+  exit 1
+fi
+
+# client_secret を用意する。環境 (--secret) > 宣言 pull > KC_BAO_PATH の順。
+# 宣言 pull はブートストラップ前に失敗するのが正常なので stderr は握りつぶし、
+# 最後まで解決できなかったときに 3 つの経路をまとめて案内する。
+ensure_secret() {
+  [ -n "${KC_CLIENT_SECRET:-}" ] && return 0
+  KC_CLIENT_SECRET=$(haj secret get KC_CLIENT_SECRET 2>/dev/null) || true
+  [ -n "${KC_CLIENT_SECRET:-}" ] && return 0
+  if [ -n "$KC_BAO_PATH" ]; then
+    # bao セッションはコアの連鎖に任せる (SPEC §10.4)
+    haj store status >/dev/null 2>&1 || haj store login >&2
+    KC_CLIENT_SECRET=$(bao kv get -field=client_secret "$KC_BAO_PATH" 2>/dev/null) || true
+  fi
+  if [ -z "${KC_CLIENT_SECRET:-}" ]; then
+    tree="${HAJ_TREE:-<インストール名>}"
+    path="${KC_BAO_PATH:-<kvパス>}"
+    echo "kc: KC_CLIENT_SECRET が得られません。次のいずれかで渡してください:" >&2
+    echo "  1) ユーザー設定に宣言 (推奨): tree.${tree}.secret.KC_CLIENT_SECRET = vault://${path}/client_secret" >&2
+    echo "  2) その場で注入: haj --secret KC_CLIENT_SECRET=vault://${path}/client_secret kc ..." >&2
+    echo "  3) KC_BAO_PATH を設定し、その kv パスに client_secret を置く (自動取得される)" >&2
+    echo "  (クライアントの作り方は 'haj docs credless' の kc 節を参照)" >&2
+    exit 1
+  fi
+}
+
+# service account トークンを 1 回だけ取得してキャッシュ (secret は argv に載せない)。
+KC_TOKEN=""
+get_token() {
+  [ -n "$KC_TOKEN" ] && return 0
+  ensure_secret
+  local ep="${KC_URL}/realms/${KC_TOKEN_REALM}/protocol/openid-connect/token" out
+  if ! out=$(printf '%s' "$KC_CLIENT_SECRET" | curl -sS --fail-with-body \
+        -d grant_type=client_credentials -d "client_id=${KC_CLIENT_ID}" \
+        --data-urlencode "client_secret@-" "$ep"); then
+    printf '%s\n' "$out" >&2
+    echo "kc: トークン取得に失敗 (client_id=${KC_CLIENT_ID} / token_realm=${KC_TOKEN_REALM})" >&2
+    exit 1
+  fi
+  KC_TOKEN=$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])') || {
+    echo "kc: トークン応答の解析に失敗" >&2; exit 1; }
+}
+
+# METHOD path-after-realm [body]  Bearer 注入して Admin API を叩く。
+api() {
+  local method="$1" path="$2" body="${3:-}" url out
+  case "$path" in
+    http://*|https://*) url="$path" ;;
+    /admin/*|/realms/*) url="${KC_URL}${path}" ;;
+    /*)                 url="${KC_URL}/admin/realms/${KC_REALM}${path}" ;;
+    *)                  url="${KC_URL}/admin/realms/${KC_REALM}/${path}" ;;
+  esac
+  get_token
+  local args=(-sS --fail-with-body -X "$method" -H "Authorization: Bearer ${KC_TOKEN}")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  if ! out=$(curl "${args[@]}" "$url"); then
+    [ -n "$out" ] && printf '%s\n' "$out" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+sub="$1"; shift
+case "$sub" in
+  api)
+    method="${1:?kc: api <METHOD> <path> [json]}"
+    path="${2:?kc: api <METHOD> <path> [json]}"
+    shift 2
+    body="" dry=0 yes=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --dry-run) dry=1; shift ;;
+        --yes|-y)  yes=1; shift ;;
+        *) body="$1"; shift ;;
+      esac
+    done
+    method=$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')
+    case "$method" in
+      GET|HEAD) : ;;
+      POST|PUT|DELETE|PATCH)
+        if [ "$dry" = 1 ] || [ "$yes" != 1 ]; then
+          case "$path" in
+            http://*|https://*) durl="$path" ;;
+            /admin/*|/realms/*) durl="${KC_URL}${path}" ;;
+            /*)                 durl="${KC_URL}/admin/realms/${KC_REALM}${path}" ;;
+            *)                  durl="${KC_URL}/admin/realms/${KC_REALM}/${path}" ;;
+          esac
+          echo "kc: (dry-run) 書込は送信しません (実行するには --yes):"
+          echo "  ${method} ${durl}"
+          [ -n "$body" ] && printf '  body: %s\n' "$body"
+          exit 0
+        fi ;;
+      *) echo "kc: 未知のメソッド '$method'" >&2; exit 1 ;;
+    esac
+    api "$method" "$path" "$body"
+    echo
+    ;;
+  users)
+    search="${1:-}"
+    q="?max=100"
+    [ -n "$search" ] && q="?max=100&search=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$search")"
+    api GET "/users$q" | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+if not d: print("  (該当なし)"); sys.exit()
+w=max(len(u.get("username","")) for u in d)
+for u in d:
+    print("  %s  %s  enabled=%s  %s" % (
+        u.get("username","-").ljust(w), (u.get("email") or "-").ljust(28),
+        u.get("enabled"), u.get("id")))'
+    ;;
+  user)
+    username="${1:?kc: user <username>}"
+    uq=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$username")
+    res=$(api GET "/users?username=${uq}&exact=true&max=1")
+    uid=$(printf '%s' "$res" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+if not d: sys.exit(3)
+print(d[0]["id"])') || { echo "kc: ユーザー '$username' が見つかりません" >&2; exit 1; }
+    printf '%s' "$res" | python3 -c '
+import sys,json
+u=json.load(sys.stdin)[0]
+for k in ("username","email","firstName","lastName","enabled","emailVerified","id"):
+    if k in u: print("  %-14s %s" % (k+":", u[k]))'
+    echo "  groups:"
+    api GET "/users/${uid}/groups" | python3 -c '
+import sys,json
+g=json.load(sys.stdin)
+print("    (なし)" if not g else "\n".join("    "+x.get("path",x.get("name","?")) for x in g))'
+    ;;
+  groups)
+    api GET "/groups?max=200" | python3 -c '
+import sys,json
+def walk(nodes,depth=0):
+    for n in nodes:
+        print("  %-40s %s" % ("  "*depth+n.get("path","/"+n.get("name","?")), n.get("id")))
+        walk(n.get("subGroups") or [], depth+1)
+walk(json.load(sys.stdin))'
+    ;;
+  clients)
+    search="${1:-}"
+    q="?max=200"
+    [ -n "$search" ] && q="?max=200&clientId=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$search")&search=true"
+    api GET "/clients$q" | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+if not d: print("  (該当なし)"); sys.exit()
+w=max(len(c.get("clientId","")) for c in d)
+for c in sorted(d,key=lambda x:x.get("clientId","")):
+    print("  %s  enabled=%-5s  %s" % (c.get("clientId","-").ljust(w), str(c.get("enabled")), c.get("id")))'
+    ;;
+  whoami)
+    get_token
+    printf '%s' "$KC_TOKEN" | python3 -c '
+import sys,json,base64
+t=sys.stdin.read().split(".")[1]; t+="="*(-len(t)%4)
+p=json.loads(base64.urlsafe_b64decode(t))
+print("  azp:  ", p.get("azp"))
+print("  iss:  ", p.get("iss"))
+ra=p.get("resource_access",{})
+for res,v in ra.items():
+    if res.endswith("-realm"):
+        print("  %s roles: %s" % (res, ", ".join(sorted(v.get("roles",[])))))'
+    ;;
+  token)
+    get_token
+    printf '%s\n' "$KC_TOKEN"
+    ;;
+  *)
+    echo "kc: unknown subcommand '$sub' (api|users|user|groups|clients|whoami|token)" >&2; exit 1 ;;
+esac

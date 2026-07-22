@@ -1,0 +1,40 @@
+#!/bin/sh
+# OCI CLI をツリー宣言 (tree.<インストール名>.secret) の資格情報で起動する。
+# 鍵は haj secret file が $XDG_RUNTIME_DIR (tmpfs) に実体化する
+# (セッション終了で自然消滅、掃除不要)。~/.oci/config も鍵ファイルも持たない。
+set -eu
+
+case "${1:-}" in
+  --haj-describe) echo "OCI CLI をツリー宣言の資格情報で起動する (鍵は一時実体化)"; exit 0 ;;
+  --haj-help)     cat <<'EOF'
+使い方: haj oci <ociの引数...>
+
+tree.<インストール名>.secret.* の宣言から資格情報を pull して OCI CLI を
+起動する。環境変数が既にあればそれが勝つ (その場の明示 > 宣言)。
+
+必要な宣言 (実効は haj secret list):
+  OCI_CLI_USER / OCI_CLI_TENANCY / OCI_CLI_FINGERPRINT / OCI_CLI_REGION
+  OCI_KEY (秘密鍵の中身。haj secret file で一時実体化して渡す)
+
+宣言が無ければ: haj tree configure <インストール名> (案内が出る)
+EOF
+    exit 0 ;;
+  --haj-complete)
+    # 実行体の補完に委譲する (§4.3 の @delegate 指示)
+    printf '@delegate\toci\n'
+    exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "# 資格情報は tree.<インストール名>.secret.* から pull (実効値は表示しない)" \
+      "# OCI_CLI_USER / OCI_CLI_TENANCY / OCI_CLI_FINGERPRINT / OCI_CLI_REGION / OCI_CLI_KEY_FILE"
+    exit 0 ;;
+esac
+
+OCI_CLI_USER="${OCI_CLI_USER:-$(haj secret get OCI_CLI_USER)}"
+OCI_CLI_TENANCY="${OCI_CLI_TENANCY:-$(haj secret get OCI_CLI_TENANCY)}"
+OCI_CLI_FINGERPRINT="${OCI_CLI_FINGERPRINT:-$(haj secret get OCI_CLI_FINGERPRINT)}"
+OCI_CLI_REGION="${OCI_CLI_REGION:-$(haj secret get OCI_CLI_REGION)}"
+OCI_CLI_KEY_FILE="${OCI_CLI_KEY_FILE:-$(haj secret file OCI_KEY)}"
+export OCI_CLI_USER OCI_CLI_TENANCY OCI_CLI_FINGERPRINT OCI_CLI_REGION OCI_CLI_KEY_FILE
+
+exec oci "$@"

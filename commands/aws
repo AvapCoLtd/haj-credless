@@ -1,0 +1,66 @@
+#!/bin/sh
+# AWS CLI をツリー宣言 (tree.<インストール名>.secret) の資格情報で起動する。
+# ~/.aws/credentials を持たない — アクセスキーは要る瞬間に bao から pull する。
+# AWS_SESSION_TOKEN 等の高度な形は将来 (docs 参照)。
+set -eu
+
+case "${1:-}" in
+  --haj-describe) echo "AWS CLI をツリー宣言の資格情報で起動する (credentials 非常駐)"; exit 0 ;;
+  --haj-help)     cat <<'EOF'
+使い方: haj aws <awsの引数...>
+
+tree.<インストール名>.secret.* の宣言からアクセスキーを pull して
+AWS CLI を起動する。環境変数が既にあればそれが勝つ (その場の明示 > 宣言)。
+
+必要な宣言 (実効は haj secret list):
+  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+
+宣言が無ければ: haj tree configure <インストール名> (案内が出る)。
+bao 側に未格納なら、エラー時に種蒔き (bao kv put) の手順を案内する。
+EOF
+    exit 0 ;;
+  --haj-complete)
+    # 実行体の補完に委譲する (§4.3 の @delegate 指示)
+    printf '@delegate\taws\n'
+    exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "# 資格情報は tree.<インストール名>.secret.* から pull (実効値は表示しない)" \
+      "# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+    exit 0 ;;
+esac
+
+# pull に失敗したら、宣言忘れと bao 未格納の両方の道筋を案内する (fail-fast)
+seed_help() {
+  key="$1"
+  echo "credless/aws: ${key} を引けませんでした。" >&2
+  echo "" >&2
+  echo "  宣言が無い場合 (haj secret list --tree ${HAJ_TREE:-credless} で確認):" >&2
+  echo "    haj tree configure ${HAJ_TREE:-credless}   # 宣言一式を取り込む" >&2
+  echo "" >&2
+  echo "  宣言はあるが bao に未格納の場合 (参照先が空) — 種蒔き:" >&2
+  ref="$(haj secret list 2>/dev/null | sed -n "s/^${key}=//p")"
+  case "$ref" in
+    vault://*)
+      # vault://users/<自分>/aws/<field> → kv パスと field に分解して実例を出す
+      path="${ref#vault://}"
+      kvpath="${path%/*}"
+      echo "    bao kv put ${kvpath} access_key_id=AKIA... secret_access_key=..." >&2
+      ;;
+    *)
+      echo "    bao kv put users/<自分>/aws access_key_id=AKIA... secret_access_key=..." >&2
+      ;;
+  esac
+  echo "    (実際の参照先: haj secret list --tree ${HAJ_TREE:-credless})" >&2
+  exit 1
+}
+
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  AWS_ACCESS_KEY_ID="$(haj secret get AWS_ACCESS_KEY_ID)" || seed_help AWS_ACCESS_KEY_ID
+fi
+if [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+  AWS_SECRET_ACCESS_KEY="$(haj secret get AWS_SECRET_ACCESS_KEY)" || seed_help AWS_SECRET_ACCESS_KEY
+fi
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+
+exec aws "$@"

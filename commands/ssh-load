@@ -1,0 +1,56 @@
+#!/bin/sh
+# ssh 鍵を bao から ssh-agent に積む。鍵はディスクを経由しない
+# (bao → パイプ → ssh-add。agent の中とセッション寿命だけ)。
+set -eu
+
+SSH_LOAD_VAULT="${SSH_LOAD_VAULT:-}"
+SSH_LOAD_KEYS="${SSH_LOAD_KEYS:-}"
+SSH_LOAD_TTL="${SSH_LOAD_TTL:-8h}"
+
+case "${1:-}" in
+  --haj-describe) echo "ssh 鍵を bao から agent に積む (ディスク非経由・期限付き)"; exit 0 ;;
+  --haj-help)     cat <<'EOF'
+使い方: haj ssh-load
+
+bao の kv パス (SSH_LOAD_VAULT) から鍵 (SSH_LOAD_KEYS のフィールド名を
+空白区切りで列挙) を読み、ssh-add -t <SSH_LOAD_TTL> で agent に積む。
+秘密鍵はパイプで渡り、ディスクには書かれない。
+
+設定 (実効値は haj env ssh-load):
+  tree.<インストール名>.env.SSH_LOAD_VAULT = users/<自分>/ssh-keys
+  tree.<インストール名>.env.SSH_LOAD_KEYS  = <フィールド名> <フィールド名...>
+  SSH_LOAD_TTL は既定 8h
+
+初期値の提案: haj tree configure <インストール名>
+鍵の格納: bao kv put users/<自分>/ssh-keys <名前>=@<秘密鍵ファイル>
+EOF
+    exit 0 ;;
+  --haj-complete) exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "SSH_LOAD_VAULT=${SSH_LOAD_VAULT}" \
+      "SSH_LOAD_KEYS=${SSH_LOAD_KEYS}" \
+      "SSH_LOAD_TTL=${SSH_LOAD_TTL}"
+    exit 0 ;;
+esac
+
+# 設定が無ければ fail-fast で導線を示す (勝手に既定パスを推測しない)
+if [ -z "$SSH_LOAD_VAULT" ] || [ -z "$SSH_LOAD_KEYS" ]; then
+  tree="${HAJ_TREE:-credless}"
+  echo "ssh-load: 設定がありません。ユーザー設定に書いてください:" >&2
+  [ -z "$SSH_LOAD_VAULT" ] && \
+    echo "  haj config set tree.${tree}.env.SSH_LOAD_VAULT users/<自分>/ssh-keys" >&2
+  [ -z "$SSH_LOAD_KEYS" ] && \
+    echo "  haj config set tree.${tree}.env.SSH_LOAD_KEYS '<フィールド名> <フィールド名...>'" >&2
+  echo "  (初期値の提案: haj tree configure ${tree} / 鍵の一覧: bao kv get ${SSH_LOAD_VAULT:-users/<自分>/ssh-keys})" >&2
+  exit 1
+fi
+
+# bao セッションはコアの連鎖に任せる (token lookup → secrets.vault_cert_login の
+# cert 認証 → secrets.vault_login の OIDC。SPEC §10.4)
+haj store status >/dev/null 2>&1 || haj store login >&2
+
+for field in $SSH_LOAD_KEYS; do
+  bao kv get -field="$field" "$SSH_LOAD_VAULT" | ssh-add -t "$SSH_LOAD_TTL" -
+done
+echo "==> $(ssh-add -l | wc -l) 本の鍵が agent にあります (期限 ${SSH_LOAD_TTL})"

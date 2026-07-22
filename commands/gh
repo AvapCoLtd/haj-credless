@@ -1,0 +1,43 @@
+#!/bin/sh
+# GitHub CLI (gh) をツリー宣言のトークンで起動する。
+# gh は GH_TOKEN 環境変数を保存済み設定より優先するので、宣言から pull して
+# 注入するだけでよい (hosts.yml へのトークン常駐が要らない)。
+set -eu
+
+case "${1:-}" in
+  --haj-describe) echo "gh をツリー宣言のトークンで起動する (PAT 非常駐)"; exit 0 ;;
+  --haj-help)     cat <<'EOF'
+使い方: haj gh <ghの引数...>
+
+tree.<インストール名>.secret.GH_TOKEN の宣言を要る瞬間に pull し、
+GH_TOKEN を据えて gh を exec する。`gh auth login` でのトークン保存
+(~/.config/gh/hosts.yml への常駐) が要らなくなる。
+
+GH_TOKEN が既に環境にあればそれが勝つ (その場の明示 > 宣言)。
+GitHub Enterprise は GH_HOST + GH_ENTERPRISE_TOKEN の宣言で同様に。
+
+宣言が無ければ: haj tree configure <インストール名> (案内が出る)
+EOF
+    exit 0 ;;
+  --haj-complete)
+    # 実行体の補完に委譲する (§4.3 の @delegate 指示)
+    printf '@delegate\tgh\n'
+    exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "# GH_TOKEN は環境 > 宣言 tree.<インストール名>.secret.GH_TOKEN の順で解決 (実効値は表示しない)" \
+      "GH_HOST=${GH_HOST:-}"
+    exit 0 ;;
+esac
+
+if [ -z "${GH_TOKEN:-}" ]; then
+  GH_TOKEN="$(haj secret get GH_TOKEN 2>/dev/null)" || {
+    echo "credless/gh: GH_TOKEN が得られません。" >&2
+    echo "  宣言の確認: haj secret list --tree ${HAJ_TREE:-credless} / haj secret check --tree ${HAJ_TREE:-credless}" >&2
+    echo "  宣言が無ければ: haj tree configure ${HAJ_TREE:-credless}" >&2
+    exit 1
+  }
+fi
+export GH_TOKEN
+
+exec gh "$@"

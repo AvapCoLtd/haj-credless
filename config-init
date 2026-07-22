@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# credless ツリーの初期値提案 (haj tree configure <インストール名> から実行される。
+# haj 0.36+ の SPEC §9.5 規約ファイル)。
+#
+# stdout に secret. の行を出すだけ。tree.<インストール名>. はコアが付け、
+# 表示 → 本人確認 → ユーザー設定への追記もコアが行う (既にある鍵は追記されない)。
+#
+# 個人パス users/<自分>/... のユーザー名の解決順 (haj SPEC §8.5 の定石):
+#   1) CREDLESS_VAULT_USER (その場の明示)
+#   2) haj config get meta.username (ユーザー設定に固定した値 — 金庫に触らない)
+#   3) bao token lookup の meta.username から検出 (固定の仕方を stderr で案内)
+# どれでも分からなければ <自分> のまま出すので、置き換えてから取り込むこと。
+set -euo pipefail
+
+user="${CREDLESS_VAULT_USER:-}"
+if [ -z "$user" ]; then
+  user=$(haj config get meta.username 2>/dev/null) || user=""
+  # 旧 haj (get 未対応) は一覧を出して成功してしまうので、値の形で弾く
+  case "$user" in
+    *[!a-zA-Z0-9._-]*) user="" ;;
+  esac
+fi
+if [ -z "$user" ]; then
+  user=$(bao token lookup -format=json 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"].get("meta",{}).get("username",""))' \
+    2>/dev/null) || user=""
+  if [ -n "$user" ]; then
+    echo "config-init: bao から検出しました: ${user} — 固定するには: haj config set meta.username ${user}" >&2
+  fi
+fi
+user="${user:-<自分>}"
+
+echo "# credless ツリーの宣言 (haj tree configure が生成)"
+echo "# oci: 資格情報5件。private_key は鍵の中身そのもの (haj secret file が一時実体化)"
+echo "secret.OCI_CLI_USER = vault://users/${user}/oci/user"
+echo "secret.OCI_CLI_TENANCY = vault://users/${user}/oci/tenancy"
+echo "secret.OCI_CLI_FINGERPRINT = vault://users/${user}/oci/fingerprint"
+echo "secret.OCI_CLI_REGION = vault://users/${user}/oci/region"
+echo "secret.OCI_KEY = vault://users/${user}/oci/private_key"
+echo "# aws: アクセスキー2件 (未格納なら haj aws がエラー時に種蒔き手順を案内する)"
+echo "secret.AWS_ACCESS_KEY_ID = vault://users/${user}/aws/access_key_id"
+echo "secret.AWS_SECRET_ACCESS_KEY = vault://users/${user}/aws/secret_access_key"
+echo "# gh: GitHub CLI のトークン (github.com)"
+echo "secret.GH_TOKEN = vault://users/${user}/github/token"
+echo "# kc: Keycloak の接続先と client_secret は組織の値なので提案できない。手動で:"
+echo "#   haj config set tree.${HAJ_TREE:-credless}.env.KC_URL 'https://keycloak.example.com/auth'"
+echo "#   haj config set tree.${HAJ_TREE:-credless}.env.KC_REALM '<realm>'"
+echo "#   haj config set tree.${HAJ_TREE:-credless}.secret.KC_CLIENT_SECRET 'vault://<共有パス>/client_secret'"
+
+# ssh-load: 鍵の置き場は個人パス。鍵フィールドの一覧は bao セッションがあれば
+# 実際の格納から検出して提案し、無ければ設定コマンドをコメントで案内する。
+echo "# ssh-load: bao から agent へ積む鍵 (格納: bao kv put users/${user}/ssh-keys <名前>=@<鍵ファイル>)"
+echo "env.SSH_LOAD_VAULT = users/${user}/ssh-keys"
+keys=""
+if [ "$user" != "<自分>" ] && bao token lookup >/dev/null 2>&1; then
+  keys=$(bao kv get -format=json "users/${user}/ssh-keys" 2>/dev/null \
+    | python3 -c 'import sys,json; print(" ".join(sorted(json.load(sys.stdin)["data"]["data"].keys())))' \
+    2>/dev/null) || keys=""
+fi
+if [ -n "$keys" ]; then
+  echo "config-init: bao の users/${user}/ssh-keys から鍵フィールドを検出しました: ${keys}" >&2
+  echo "env.SSH_LOAD_KEYS = ${keys}"
+else
+  echo "# 鍵フィールドの一覧は手動で (bao 未接続か未格納のため検出できず):"
+  echo "#   haj config set tree.${HAJ_TREE:-credless}.env.SSH_LOAD_KEYS '<フィールド名> <フィールド名...>'"
+  echo "config-init: ssh-load の鍵一覧を検出できませんでした。haj config set tree.${HAJ_TREE:-credless}.env.SSH_LOAD_KEYS '...' で設定してください" >&2
+fi
+
+# glab のテンプレート宣言は config-init では取り込めない (コアが受けるのは
+# env. / secret. のみ)。手動での宣言コマンドを stderr で案内し、取り込み後の
+# 設定ファイルにもコメントとして残す。
+tpl="${HOME}/.config/glab-cli/config.yml.tpl"
+echo "# glab: テンプレート宣言は手動で (config-init は env./secret. のみ受理):"
+echo "#   haj config set tree.${HAJ_TREE:-credless}.template.GLAB_CONFIG ~/.config/glab-cli/config.yml.tpl"
+if [ -f "$tpl" ]; then
+  echo "config-init: glab のテンプレート宣言は手動です: haj config set tree.${HAJ_TREE:-credless}.template.GLAB_CONFIG ~/.config/glab-cli/config.yml.tpl" >&2
+else
+  echo "#   (${tpl} が未作成。書き方: haj docs credless)"
+  echo "config-init: ${tpl} がまだありません。config.yml の PAT 部分を vault 参照にした tpl を作ってから宣言してください (haj docs credless に例)" >&2
+fi
+
+if [ "$user" = "<自分>" ]; then
+  echo "config-init: bao のユーザー名を検出できませんでした。<自分> を置き換えてから取り込んでください (bao ログイン後にやり直すのでも可)" >&2
+fi

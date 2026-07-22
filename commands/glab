@@ -1,0 +1,43 @@
+#!/bin/sh
+# GitLab CLI (glab) をツリー宣言のテンプレート設定で起動する。
+# config.yml は haj secret template が管理領域 (tmpfs) にレンダリングする
+# (セッション寿命)。PAT がディスクに常駐しない。
+set -eu
+
+case "${1:-}" in
+  --haj-describe) echo "glab をツリー宣言のテンプレート設定で起動する (PAT 非常駐)"; exit 0 ;;
+  --haj-help)     cat <<'EOF'
+使い方: haj glab <glabの引数...>
+
+tree.<インストール名>.template.GLAB_CONFIG の宣言 (config.yml.tpl) を
+レンダリングして GLAB_CONFIG_DIR に据え、glab を起動する。PAT は
+テンプレート内の vault 参照から解決される (実効は haj secret list / check)。
+
+GLAB_CONFIG_DIR が既に環境にあればそれが勝つ (その場の明示 > 宣言)。
+
+宣言が無ければ: haj tree configure <インストール名> (案内が出る)
+EOF
+    exit 0 ;;
+  --haj-complete)
+    # 実行体の補完に委譲する (§4.3 の @delegate 指示)
+    printf '@delegate\tglab\n'
+    exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "# 設定は tree.<インストール名>.template.GLAB_CONFIG から生成 (実効値は表示しない)" \
+      "# GLAB_CONFIG_DIR (未設定なら haj secret tmpdir glab に生成)"
+    exit 0 ;;
+esac
+
+if [ -z "${GLAB_CONFIG_DIR:-}" ]; then
+  GLAB_CONFIG_DIR="$(haj secret tmpdir glab)"
+  haj secret template GLAB_CONFIG --out "${GLAB_CONFIG_DIR}/config.yml" >/dev/null || {
+    echo "credless/glab: テンプレートを実体化できませんでした。" >&2
+    echo "  宣言の確認: haj secret list --tree ${HAJ_TREE:-credless} / haj secret check --tree ${HAJ_TREE:-credless}" >&2
+    echo "  宣言が無ければ: haj tree configure ${HAJ_TREE:-credless}" >&2
+    exit 1
+  }
+fi
+export GLAB_CONFIG_DIR
+
+exec glab "$@"
