@@ -1,5 +1,8 @@
 # credless — haj ツリー
 
+{@project haj}
+{@link rel=profile} [haj profile](https://gitlab.avaper.day/avap/haj/gitlab-profile)
+
 機密性が高いのに資格情報がローカルPCに放置されがちな CLI 群 (glab, gh, oci, aws,
 kc, ssh) を、haj の仕組みで**手元に何も留めずに**使えるようにするツリー。
 token・秘密鍵・credentials のディスク常駐を、bao 常駐 + tmpfs 一時実体化
