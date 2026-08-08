@@ -79,6 +79,12 @@ else
   echo "config-init: ${tpl} がまだありません。config.yml の PAT 部分を vault 参照にした tpl を作ってから宣言してください (haj docs credless に例)" >&2
 fi
 
+# glab-rotate: 基底パスは種蒔き規約から提案できるが、ホスト一覧は組織の値
+# なので手動 (kc と同様、コメントで案内を残す)。
+echo "# glab-rotate: PAT の self-rotate。実パスは <基底>/<ホスト>。ホスト一覧は手動で:"
+echo "#   haj config set tree.${HAJ_TREE:-credless}.env.GLAB_ROTATE_HOSTS '<gitlabホスト> <gitlabホスト...>'"
+echo "env.GLAB_ROTATE_VAULT = users/${user}/gitlab-pat"
+
 if [ "$user" = "<自分>" ]; then
   echo "config-init: bao のユーザー名を検出できませんでした。<自分> を置き換えてから取り込んでください (bao ログイン後にやり直すのでも可)" >&2
 fi

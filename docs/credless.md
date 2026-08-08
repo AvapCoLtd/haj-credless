@@ -56,6 +56,44 @@ hosts:
 `haj glab ...` は `haj secret tmpdir glab` (tmpfs・0700・セッション寿命) に
 config.yml をレンダリングし、`GLAB_CONFIG_DIR` を据えて glab を exec する。
 
+### 期限切れ前のローテーション (glab-rotate)
+
+GitLab 16.10+ の self-rotate API (`POST /personal_access_tokens/self/rotate`)
+で PAT を回し、bao の種を入れ替える。config.yml は `haj glab` が毎回
+レンダリングし直すので、bao さえ更新されれば他にやることは無い。
+
+マルチホスト前提: 対象は `GLAB_ROTATE_HOSTS` (空白区切り) で列挙し、
+各ホストの PAT は `<GLAB_ROTATE_VAULT>/<ホスト>` から読む (tpl の
+`users/<自分>/gitlab-pat/<ホスト>` 規約と同じ)。基底パスは config-init が
+提案するので、ホスト一覧だけ手動 (実効値は `haj env glab-rotate`):
+
+```sh
+haj config set tree.haj-credless.env.GLAB_ROTATE_HOSTS 'gitlab.example.com gitlab.other.com'
+haj config set tree.haj-credless.env.GLAB_ROTATE_VAULT users/<自分>/gitlab-pat
+```
+
+使い方 (ホストを引数に与えればそのホストだけ。無指定は全ホスト):
+
+```sh
+haj glab-rotate --check                      # 全ホストの期限・スコープの確認のみ
+haj glab-rotate                              # 残り GLAB_ROTATE_MARGIN 日 (既定7) を切っていたら回す (冪等)
+haj glab-rotate --force gitlab.example.com   # そのホストだけ今すぐ回す
+```
+
+ホストごとに独立して処理し、途中で失敗しても残りを続けて最後に非0で終わる。
+
+- 新トークンの寿命は `GLAB_ROTATE_TTL` 日 (既定 30)。無印は冪等なので
+  cron やログイン時フックに置ける。
+- 前提スコープ: `api` (GitLab 17.9+ なら rotate 専用の `self_rotate` でも可)。
+- rotate は生きたトークンでしか呼べない。**切れた後は Web UI で再発行**して
+  `bao kv put` で種蒔きし直す (この道具は期限前に回すためのもの)。
+- 旧トークンは rotate の瞬間に失効する。新トークンは応答 → tmpfs 退避 →
+  bao 書き戻し → 退避削除の順で扱い、書き戻しに失敗したときは退避パスと
+  復旧コマンドを案内する (ロックアウト防止)。
+- rotate 済みの旧トークンを使うと GitLab は再利用検知で**新トークンごと**
+  ファミリー失効させる。`haj glab` は毎回レンダリングするので通常は無縁だが、
+  `GLAB_CONFIG_DIR` を export したまま生かしている古いシェルからは叩かないこと。
+
 ## gh
 
 宣言 1 件 (config-init が提案する):

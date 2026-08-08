@@ -18,6 +18,7 @@ ssh config 等) は各社ツリー (avap 等) へ、Mattermost 操作は matterm
 | コマンド | 置き換えるもの | 仕組み |
 |---|---|---|
 | `haj glab` | `~/.config/glab-cli/config.yml` の PAT 常駐 | tpl を `haj secret template` でレンダリング → `GLAB_CONFIG_DIR` (tmpfs) |
+| `haj glab-rotate` | PAT の期限切れ → Web UI で手動再発行 | self-rotate API で期限前に回して bao の種を更新 (新トークンは tmpfs 退避つき) |
 | `haj gh` | `gh auth login` の hosts.yml へのトークン常駐 | `haj secret get` で pull して `GH_TOKEN` 注入 |
 | `haj oci` | `~/.oci/config` + 秘密鍵ファイル | `haj secret get` で pull、鍵は `haj secret file` で一時実体化 |
 | `haj aws` | `~/.aws/credentials` | `haj secret get` で pull して env 注入 |
