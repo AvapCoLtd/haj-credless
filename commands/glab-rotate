@@ -5,10 +5,17 @@
 # (書き戻しに失敗してもロックアウトしない)。永続ディスクには書かれない。
 # rotate は生きたトークンでしか呼べない — 期限が切れる前に回すこと
 # (残り日数の閾値つきで冪等。cron / ログイン時フックに置ける)。
+#
+# --as <actor>: 個人名義でなく service account (agents/<actor>/...) 名義で
+# 回す。PAT の読み書き先だけ store (agents/<actor>/gitlab-pat/<host> の
+# token) に切り替わる — GLAB_ROTATE_VAULT は使わない。ホスト解決・margin・
+# ttl・退避の意味論は無印と同一 (workitem-20260812-jyjfyd)。
+# --seed --as <actor> <ホスト>: stdin から PAT を1行読み、store の同パスへ
+# 種蒔きする (初回投入。値は echo しない・--force は付けない)。
 set -eu
 
 GLAB_ROTATE_HOSTS="${GLAB_ROTATE_HOSTS:-}"   # 必須。対象ホストの空白区切り一覧
-GLAB_ROTATE_VAULT="${GLAB_ROTATE_VAULT:-}"   # 必須。bao の基底 kv パス (実パスは <基底>/<ホスト>)
+GLAB_ROTATE_VAULT="${GLAB_ROTATE_VAULT:-}"   # 必須 (無印のみ)。bao の基底 kv パス (実パスは <基底>/<ホスト>)
 GLAB_ROTATE_FIELD="${GLAB_ROTATE_FIELD:-token}"
 GLAB_ROTATE_MARGIN="${GLAB_ROTATE_MARGIN:-7}"
 GLAB_ROTATE_TTL="${GLAB_ROTATE_TTL:-30}"
@@ -55,25 +62,88 @@ EOF
 esac
 
 mode=rotate
+actor=""
+seed=""
+force=""
 hosts=""
-for a in "$@"; do
-  case "$a" in
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --as)
+      shift
+      actor="${1:-}"
+      case "$actor" in
+        ''|--*|*[!a-z0-9-]*)
+          echo "glab-rotate --as: actor 名 ([a-z0-9-]+) が要ります" >&2
+          exit 1 ;;
+      esac
+      ;;
+    --seed) seed=1 ;;
     --check) mode=check ;;
-    --force) mode=force ;;
-    -*) echo "glab-rotate: 未知の引数 '$a' (--check | --force | <ホスト>...)" >&2; exit 1 ;;
-    *) hosts="${hosts} ${a}" ;;
+    --force) mode=force; force=1 ;;
+    -*) echo "glab-rotate: 未知の引数 '$1' (--as <actor> | --seed | --check | --force | <ホスト>...)" >&2; exit 1 ;;
+    *) hosts="${hosts} ${1}" ;;
   esac
+  shift
 done
-[ -n "$hosts" ] || hosts="$GLAB_ROTATE_HOSTS"
 
-# 設定が無ければ fail-fast で導線を示す (勝手に既定パスを推測しない)
-if [ -z "$hosts" ] || [ -z "$GLAB_ROTATE_VAULT" ]; then
+if [ -n "$seed" ]; then
+  # 種蒔き: --as 必須・ホスト1つ必須 (GLAB_ROTATE_HOSTS へのフォールバックはしない —
+  # 種蒔きは明示したホストにだけ効かせる)
+  [ -n "$actor" ] || {
+    echo "glab-rotate --seed: --as <actor> が必須です (使い方: haj glab-rotate --seed --as <actor> <ホスト>)" >&2
+    exit 1
+  }
+  set -- $hosts
+  if [ $# -ne 1 ] || [ -z "$1" ]; then
+    echo "glab-rotate --seed: ホストを1つだけ指定してください (使い方: haj glab-rotate --seed --as ${actor} <ホスト>)" >&2
+    exit 1
+  fi
+  host="$1"
+  path="agents/${actor}/gitlab-pat/${host}/token"
+  haj store status >/dev/null 2>&1 || haj store login >&2
+  # #1: 既存値があれば --force 無しには上書きしない (失効時の再種蒔きは --force)
+  if [ -z "$force" ] && haj store get "$path" >/dev/null 2>&1; then
+    echo "glab-rotate --seed: ${actor}/${host}: 既にあります。上書きは --force (使い方: haj glab-rotate --seed --force --as ${actor} ${host})" >&2
+    exit 1
+  fi
+  # #7: stdin から1行だけ読む (末尾改行が無くても最終行を読む)。空なら fail-fast
+  IFS= read -r pat || true
+  [ -n "$pat" ] || {
+    echo "glab-rotate --seed: PAT が空です (stdin の1行目)" >&2
+    exit 1
+  }
+  force_flag=""
+  [ -z "$force" ] || force_flag="--force"
+  printf '%s' "$pat" | haj store put $force_flag "$path" || exit 1
+  echo "==> ${actor}/${host}: PAT を種蒔きしました (haj glab --as ${actor} / haj glab-rotate --as ${actor} で利用可能)"
+  exit 0
+fi
+
+# #6: ホスト解決は 引数 → (actor 名義なら) GLAB_AS_HOSTS → GLAB_ROTATE_HOSTS の順
+if [ -z "$hosts" ]; then
+  if [ -n "$actor" ]; then
+    hosts="${GLAB_AS_HOSTS:-${GLAB_ROTATE_HOSTS:-}}"
+  else
+    hosts="$GLAB_ROTATE_HOSTS"
+  fi
+fi
+
+# 設定が無ければ fail-fast で導線を示す (勝手に既定パスを推測しない)。
+# actor 名義では GLAB_ROTATE_VAULT は使わないので、その欠落は問わない
+if [ -z "$hosts" ] || { [ -z "$actor" ] && [ -z "$GLAB_ROTATE_VAULT" ]; }; then
   tree="${HAJ_TREE:-credless}"
   echo "glab-rotate: 設定がありません。ユーザー設定に書いてください:" >&2
-  [ -z "$hosts" ] && \
-    echo "  haj config set tree.${tree}.env.GLAB_ROTATE_HOSTS '<gitlabホスト> <gitlabホスト...>'" >&2
-  [ -z "$GLAB_ROTATE_VAULT" ] && \
+  if [ -z "$hosts" ]; then
+    if [ -n "$actor" ]; then
+      echo "  haj config set tree.${tree}.env.GLAB_AS_HOSTS '<gitlabホスト> <gitlabホスト...>'" >&2
+      echo "  (未設定なら tree.${tree}.env.GLAB_ROTATE_HOSTS を流用します)" >&2
+    else
+      echo "  haj config set tree.${tree}.env.GLAB_ROTATE_HOSTS '<gitlabホスト> <gitlabホスト...>'" >&2
+    fi
+  fi
+  if [ -z "$actor" ] && [ -z "$GLAB_ROTATE_VAULT" ]; then
     echo "  haj config set tree.${tree}.env.GLAB_ROTATE_VAULT 'users/<自分>/gitlab-pat'" >&2
+  fi
   exit 1
 fi
 
@@ -87,36 +157,52 @@ tmpdir=$(haj secret tmpdir glab-rotate)
 # 1 ホストぶんの処理。失敗は return 1 (呼び出し側が集計して続行する)
 rotate_one() {
   host="$1"
-  vault="${GLAB_ROTATE_VAULT}/${host}"
   api="https://${host}/api/v4/personal_access_tokens/self"
-  current="${tmpdir}/${host}.current.json"   # 今の格納 (token 以外のフィールドを保って書き戻すため)
-  backup="${tmpdir}/${host}.rotated.json"    # rotate 応答の退避 (bao 書き戻し成功まで)
-  merged="${tmpdir}/${host}.merged.json"     # 書き戻す本体
 
-  bao kv get -format=json "$vault" 2>/dev/null \
-    | python3 -c 'import sys,json; json.dump(json.load(sys.stdin)["data"]["data"], sys.stdout)' \
-    > "$current" 2>/dev/null || {
-    echo "glab-rotate: ${host}: bao の ${vault} を読めません。種蒔きは:" >&2
-    echo "  bao kv put ${vault} ${GLAB_ROTATE_FIELD}=glpat-..." >&2
-    return 1
-  }
-  tok=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' \
-    "$current" "$GLAB_ROTATE_FIELD")
-  [ -n "$tok" ] || {
-    echo "glab-rotate: ${host}: ${vault} に ${GLAB_ROTATE_FIELD} フィールドがありません" >&2
-    return 1
-  }
+  if [ -n "$actor" ]; then
+    path="agents/${actor}/gitlab-pat/${host}/token"
+    # #5: store のエラーを見せる (2>/dev/null で握りつぶさない)
+    tok=$(haj store get "$path") || {
+      echo "glab-rotate --as: ${actor}/${host}: store の ${path} を読めません。種蒔きは:" >&2
+      echo "  haj glab-rotate --seed --as ${actor} ${host} < <PATファイル>" >&2
+      return 1
+    }
+  else
+    vault="${GLAB_ROTATE_VAULT}/${host}"
+    current="${tmpdir}/${host}.current.json"   # 今の格納 (token 以外のフィールドを保って書き戻すため)
+    bao kv get -format=json "$vault" 2>/dev/null \
+      | python3 -c 'import sys,json; json.dump(json.load(sys.stdin)["data"]["data"], sys.stdout)' \
+      > "$current" 2>/dev/null || {
+      echo "glab-rotate: ${host}: bao の ${vault} を読めません。種蒔きは:" >&2
+      echo "  bao kv put ${vault} ${GLAB_ROTATE_FIELD}=glpat-..." >&2
+      return 1
+    }
+    tok=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' \
+      "$current" "$GLAB_ROTATE_FIELD")
+    [ -n "$tok" ] || {
+      echo "glab-rotate: ${host}: ${vault} に ${GLAB_ROTATE_FIELD} フィールドがありません" >&2
+      return 1
+    }
+  fi
 
   # トークンはヘッダごと stdin で渡す (curl -H @-)
   if ! info=$(printf 'PRIVATE-TOKEN: %s' "$tok" | curl -sS --fail-with-body -H @- "$api"); then
     [ -n "$info" ] && printf '%s\n' "$info" >&2
     echo "glab-rotate: ${host}: トークン情報を読めません (失効済みの可能性)。" >&2
-    echo "  切れた後は rotate 不可 — Web UI で再発行して: bao kv put ${vault} ${GLAB_ROTATE_FIELD}=glpat-..." >&2
+    if [ -n "$actor" ]; then
+      echo "  切れた後は rotate 不可 — 再発行して: haj glab-rotate --seed --force --as ${actor} ${host} < <PATファイル>" >&2
+    else
+      echo "  切れた後は rotate 不可 — Web UI で再発行して: bao kv put ${vault} ${GLAB_ROTATE_FIELD}=glpat-..." >&2
+    fi
     return 1
   fi
 
   if [ "$mode" = check ]; then
-    echo "==> ${host} の PAT (bao: ${vault})"
+    if [ -n "$actor" ]; then
+      echo "==> ${host} の PAT (store: agents/${actor}/gitlab-pat/${host}/token)"
+    else
+      echo "==> ${host} の PAT (bao: ${vault})"
+    fi
     printf '%s' "$info" | python3 -c '
 import sys,json,datetime
 d=json.load(sys.stdin)
@@ -151,34 +237,62 @@ print("" if not e else (datetime.date.fromisoformat(e)-datetime.date.today()).da
     [ -n "$resp" ] && printf '%s\n' "$resp" >&2
     echo "glab-rotate: ${host}: rotate に失敗しました。" >&2
     echo "  403 なら PAT のスコープ不足 (api か self_rotate が必要)" >&2
-    echo "  401 なら失効済み — Web UI で再発行して: bao kv put ${vault} ${GLAB_ROTATE_FIELD}=glpat-..." >&2
+    if [ -n "$actor" ]; then
+      echo "  401 なら失効済み — 再発行して: haj glab-rotate --seed --force --as ${actor} ${host} < <PATファイル>" >&2
+    else
+      echo "  401 なら失効済み — Web UI で再発行して: bao kv put ${vault} ${GLAB_ROTATE_FIELD}=glpat-..." >&2
+    fi
     return 1
   fi
 
-  # ここから旧トークンは死んでいる。応答をまず退避してから bao へ書き戻す
-  printf '%s' "$resp" > "$backup"
-  python3 -c '
+  # ここから旧トークンは死んでいる。新トークンをまず退避してから書き戻す
+  if [ -n "$actor" ]; then
+    new_token=$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])') || {
+      echo "glab-rotate --as: ${host}: rotate 応答の解析に失敗しました (トークンは失われました — 要再発行)。" >&2
+      return 1
+    }
+    backup="${tmpdir}/${actor}.${host}.rotated"
+    printf '%s' "$new_token" > "$backup"
+    ok=""
+    for _ in 1 2 3; do
+      if printf '%s' "$new_token" | haj store put --force "$path" >/dev/null 2>&1; then ok=1; break; fi
+      sleep 2
+    done
+    if [ -z "$ok" ]; then
+      echo "glab-rotate --as: ${actor}/${host}: rotate は成功しましたが store への書き戻しに失敗しました (旧トークンは既に失効)。" >&2
+      echo "  新トークンは tmpfs に退避されています (セッション寿命 — セッションを閉じないこと)。復旧:" >&2
+      echo "    haj glab-rotate --seed --force --as ${actor} ${host} < ${backup}" >&2
+      return 1
+    fi
+    rm -f "$backup"
+    echo "==> ${actor}/${host}: PAT を回しました (新しい期限 ${new_exp}。次の haj glab --as ${actor} から新トークン)"
+  else
+    backup="${tmpdir}/${host}.rotated.json"    # rotate 応答の退避 (bao 書き戻し成功まで)
+    merged="${tmpdir}/${host}.merged.json"     # 書き戻す本体
+    printf '%s' "$resp" > "$backup"
+    python3 -c '
 import sys,json
 cur=json.load(open(sys.argv[1])); resp=json.load(open(sys.argv[2]))
 cur[sys.argv[3]]=resp["token"]
 json.dump(cur, open(sys.argv[4],"w"))' "$current" "$backup" "$GLAB_ROTATE_FIELD" "$merged" || {
-    echo "glab-rotate: ${host}: rotate 応答の解析に失敗。新トークンは ${backup} に退避しています (token フィールド)" >&2
-    return 1
-  }
+      echo "glab-rotate: ${host}: rotate 応答の解析に失敗。新トークンは ${backup} に退避しています (token フィールド)" >&2
+      return 1
+    }
 
-  ok=""
-  for _ in 1 2 3; do
-    if bao kv put "$vault" @"$merged" >/dev/null 2>&1; then ok=1; break; fi
-    sleep 2
-  done
-  if [ -z "$ok" ]; then
-    echo "glab-rotate: ${host}: rotate は成功しましたが bao への書き戻しに失敗しました (旧トークンは既に失効)。" >&2
-    echo "  新トークンは tmpfs に退避されています (セッション寿命 — セッションを閉じないこと)。復旧:" >&2
-    echo "    bao kv put ${vault} @${merged}" >&2
-    return 1
+    ok=""
+    for _ in 1 2 3; do
+      if bao kv put "$vault" @"$merged" >/dev/null 2>&1; then ok=1; break; fi
+      sleep 2
+    done
+    if [ -z "$ok" ]; then
+      echo "glab-rotate: ${host}: rotate は成功しましたが bao への書き戻しに失敗しました (旧トークンは既に失効)。" >&2
+      echo "  新トークンは tmpfs に退避されています (セッション寿命 — セッションを閉じないこと)。復旧:" >&2
+      echo "    bao kv put ${vault} @${merged}" >&2
+      return 1
+    fi
+    rm -f "$backup" "$merged" "$current"
+    echo "==> ${host}: PAT を回しました (新しい期限 ${new_exp}。次の haj glab から新トークン)"
   fi
-  rm -f "$backup" "$merged" "$current"
-  echo "==> ${host}: PAT を回しました (新しい期限 ${new_exp}。次の haj glab から新トークン)"
 }
 
 fail=0
