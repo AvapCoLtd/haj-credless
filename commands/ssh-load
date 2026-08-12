@@ -1,6 +1,14 @@
 #!/bin/sh
 # ssh 鍵を bao から ssh-agent に積む。鍵はディスクを経由しない
 # (bao → パイプ → ssh-add。agent の中とセッション寿命だけ)。
+#
+# --as <actor> [<ホスト>]: 個人名義でなく service account (agents/<actor>/...)
+# の署名鍵を積む。鍵は store (agents/<actor>/ssh-signing/<host> の key) から
+# 読み、パイプで ssh-add へ (ディスク非経由)。ホスト省略時は
+# GLAB_AS_HOSTS (→ GLAB_ROTATE_HOSTS) の先頭 (workitem-20260812-jyjfyd)。
+# --seed --as <actor> <ホスト>: stdin から OpenSSH 秘密鍵を読み、key に格納。
+# ssh-keygen -y で公開鍵を導出し pub にも格納する (種蒔き)。秘密鍵の実体化は
+# tmpfs (haj secret tmpdir) だけを使い、使用後に消す。
 set -eu
 
 SSH_LOAD_VAULT="${SSH_LOAD_VAULT:-}"
@@ -34,6 +42,117 @@ EOF
     exit 0 ;;
 esac
 
+# --as / --seed: コマンド名直後のフラグ。無印 (どちらも無し) では従来どおり
+# 引数を見ない (後方互換 — 既存の呼び出しを壊さない)
+actor=""
+seed=""
+force=""
+host=""
+if [ "${1:-}" = --as ] || [ "${1:-}" = --seed ]; then
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as)
+        shift
+        actor="${1:-}"
+        case "$actor" in
+          ''|--*|*[!a-z0-9-]*)
+            echo "ssh-load --as: actor 名 ([a-z0-9-]+) が要ります" >&2
+            exit 1 ;;
+        esac
+        ;;
+      --seed) seed=1 ;;
+      --force) force=1 ;;
+      -*) echo "ssh-load: 未知の引数 '$1' (--as <actor> | --seed | --force | <ホスト>)" >&2; exit 1 ;;
+      *)
+        if [ -n "$host" ]; then
+          echo "ssh-load: ホストは1つだけ指定してください" >&2
+          exit 1
+        fi
+        host="$1"
+        ;;
+    esac
+    shift
+  done
+fi
+
+if [ -n "$seed" ]; then
+  [ -n "$actor" ] || {
+    echo "ssh-load --seed: --as <actor> が必須です (使い方: haj ssh-load --seed --as <actor> <ホスト>)" >&2
+    exit 1
+  }
+  [ -n "$host" ] || {
+    echo "ssh-load --seed: ホストが必須です (使い方: haj ssh-load --seed --as ${actor} <ホスト>)" >&2
+    exit 1
+  }
+  haj store status >/dev/null 2>&1 || haj store login >&2
+  path="agents/${actor}/ssh-signing/${host}"
+  # #1: 既存値があれば --force 無しには上書きしない。key/pub の2フィールドを
+  # 同じ規約で見る (片肺状態からでも --force で再投入できるように)
+  if [ -z "$force" ]; then
+    exists=""
+    haj store get "${path}/key" >/dev/null 2>&1 && exists=1
+    haj store get "${path}/pub" >/dev/null 2>&1 && exists=1
+    if [ -n "$exists" ]; then
+      echo "ssh-load --seed: ${actor}/${host}: 既にあります。上書きは --force (使い方: haj ssh-load --seed --force --as ${actor} ${host})" >&2
+      exit 1
+    fi
+  fi
+  umask 077
+  keydir="$(haj secret tmpdir ssh-load-as)"
+  keyfile="${keydir}/${actor}.${host}.key"
+  errfile="${keydir}/${actor}.${host}.err"
+  # ssh-keygen -y はファイルでしか鍵を読めないため、tmpfs に一時実体化する
+  # (ディスク常駐は禁止だが tmpfs=haj secret tmpdir は許容 — 使用後に消す)
+  cat > "$keyfile"
+  chmod 600 "$keyfile"
+  # #8: stdout (公開鍵) と stderr を分離。stderr は失敗時にだけ見せ、pub に混ぜない
+  if ! pub=$(ssh-keygen -y -f "$keyfile" 2>"$errfile"); then
+    err=$(cat "$errfile" 2>/dev/null)
+    echo "ssh-load --seed: 秘密鍵から公開鍵を導出できませんでした: ${err}" >&2
+    rm -f "$keyfile" "$errfile"
+    exit 1
+  fi
+  rm -f "$errfile"
+  force_flag=""
+  [ -z "$force" ] || force_flag="--force"
+  if ! haj store put $force_flag "${path}/key" < "$keyfile"; then
+    rm -f "$keyfile"
+    echo "ssh-load --seed: ${actor}/${host}: key の store 書き込みに失敗しました" >&2
+    exit 1
+  fi
+  rm -f "$keyfile"
+  if ! printf '%s\n' "$pub" | haj store put $force_flag "${path}/pub"; then
+    echo "ssh-load --seed: ${actor}/${host}: pub の store 書き込みに失敗しました (key は既に書き込み済み)" >&2
+    exit 1
+  fi
+  echo "==> ${actor}/${host}: 署名鍵を種蒔きしました (key + pub)"
+  exit 0
+fi
+
+if [ -n "$actor" ]; then
+  if [ -z "$host" ]; then
+    host="${GLAB_AS_HOSTS:-${GLAB_ROTATE_HOSTS:-}}"
+    host="${host%% *}"
+  fi
+  if [ -z "$host" ]; then
+    tree="${HAJ_TREE:-credless}"
+    echo "ssh-load --as: ホストが決まりません。haj ssh-load --as ${actor} <ホスト> と明示するか、" >&2
+    echo "  haj config set tree.${tree}.env.GLAB_AS_HOSTS '<gitlabホスト> <gitlabホスト...>' を設定してください" >&2
+    exit 1
+  fi
+  haj store status >/dev/null 2>&1 || haj store login >&2
+  path="agents/${actor}/ssh-signing/${host}/key"
+  key=$(haj store get "$path") || {
+    echo "ssh-load --as: ${actor}/${host}: store の ${path} から鍵を読めません。種蒔きは:" >&2
+    echo "  haj ssh-load --seed --as ${actor} ${host} < <秘密鍵ファイル>" >&2
+    exit 1
+  }
+  printf '%s\n' "$key" | ssh-add -t "$SSH_LOAD_TTL" -
+  echo "==> ${actor}/${host}: 署名鍵を agent に積みました (期限 ${SSH_LOAD_TTL})"
+  exit 0
+fi
+
+# ---- ここから無印 (--as / --seed 無し。従来どおり) ----
 # 設定が無ければ fail-fast で導線を示す (勝手に既定パスを推測しない)
 if [ -z "$SSH_LOAD_VAULT" ] || [ -z "$SSH_LOAD_KEYS" ]; then
   tree="${HAJ_TREE:-credless}"

@@ -2,6 +2,11 @@
 # GitLab CLI (glab) をツリー宣言のテンプレート設定で起動する。
 # config.yml は haj secret template が管理領域 (tmpfs) にレンダリングする
 # (セッション寿命)。PAT がディスクに常駐しない。
+#
+# --as <actor>: 個人名義でなく service account (agents/<actor>/...) 名義で
+# 起動する (workitem-20260812-jyjfyd)。config.yml はテンプレート宣言を使わず
+# コマンド内で生成する — PAT は store (agents/<actor>/gitlab-pat/<host> の
+# token フィールド) から引く。無印 (--as 無し) の経路・挙動は変えない。
 set -eu
 
 case "${1:-}" in
@@ -29,6 +34,55 @@ EOF
     exit 0 ;;
 esac
 
+# --as <actor>: コマンド名直後のフラグ (§4 の位置取り)。actor 名は [a-z0-9-]+
+actor=""
+if [ "${1:-}" = --as ]; then
+  shift
+  actor="${1:-}"
+  case "$actor" in
+    ''|--*|*[!a-z0-9-]*)
+      echo "glab --as: actor 名 ([a-z0-9-]+) が要ります (使い方: haj glab --as <actor> <glabの引数...>)" >&2
+      exit 1 ;;
+  esac
+  shift
+fi
+
+if [ -n "$actor" ]; then
+  # actor 名義: config.yml をコマンド内で生成する (テンプレート宣言は使わない)。
+  # 環境の GLAB_CONFIG_DIR は無視する — 無印の「env が勝つ」規約はここには
+  # 適用しない。actor 用 config は必ず作り直す (#3)
+  hosts="${GLAB_AS_HOSTS:-${GLAB_ROTATE_HOSTS:-}}"
+  if [ -z "$hosts" ]; then
+    tree="${HAJ_TREE:-credless}"
+    echo "glab --as: 対象ホストが未設定です。設定してください:" >&2
+    echo "  haj config set tree.${tree}.env.GLAB_AS_HOSTS '<gitlabホスト> <gitlabホスト...>'" >&2
+    echo "  (未設定なら tree.${tree}.env.GLAB_ROTATE_HOSTS を流用します)" >&2
+    exit 1
+  fi
+  haj store status >/dev/null 2>&1 || haj store login >&2
+  GLAB_CONFIG_DIR="$(haj secret tmpdir "glab-${actor}")"
+  cfg="${GLAB_CONFIG_DIR}/config.yml"
+  # umask は config.yml 生成のあいだだけ 077 (サブシェル化して exec glab には持ち越さない・#13)
+  (
+    umask 077
+    {
+      echo "hosts:"
+      for host in $hosts; do
+        token=$(haj store get "agents/${actor}/gitlab-pat/${host}/token") || {
+          echo "glab --as: ${actor}/${host}: gitlab-pat を store から読めません。種蒔きは:" >&2
+          echo "  haj glab-rotate --seed --as ${actor} ${host} < <PATファイル>" >&2
+          exit 1
+        }
+        printf '    %s:\n        token: %s\n        git_protocol: https\n        api_protocol: https\n' \
+          "$host" "$token"
+      done
+    } > "$cfg"
+  ) || exit 1
+  export GLAB_CONFIG_DIR
+  exec glab "$@"
+fi
+
+# ---- ここから無印 (--as 無し。従来どおり) ----
 if [ -z "${GLAB_CONFIG_DIR:-}" ]; then
   GLAB_CONFIG_DIR="$(haj secret tmpdir glab)"
   haj secret template GLAB_CONFIG --out "${GLAB_CONFIG_DIR}/config.yml" >/dev/null || {

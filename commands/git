@@ -1,0 +1,185 @@
+#!/bin/sh
+# git を service account (agents/<actor>/...) 名義で起動する
+# (workitem-20260812-jyjfyd)。commit の author/email・push の資格情報・
+# commit 署名を、store から引いて -c で注入する。無印 (--as 無し) の
+# haj git は無い — このコマンドは --as 専用 (常駐する秘密は無い: PAT は
+# メモリ変数 → env → インライン credential helper、署名鍵は
+# user.signingkey の key:: 直値でディスクを経由しない)。
+set -eu
+
+case "${1:-}" in
+  --haj-describe) echo "actor 名義で git を起動する (credential/identity/署名を store から注入)"; exit 0 ;;
+  --haj-help)     cat <<'EOF'
+使い方: haj git --as <actor> <gitの引数...>
+       haj git --seed [--force] --as <actor>
+
+--as <actor>: service account (agents/<actor>/...) 名義で git を exec する。
+注入する -c:
+  credential.helper       まず空値でリセットしてから (既存 helper 連鎖を
+                           断ち切る)、HTTPS+PAT のインライン helper を足す
+                           (ディスク非経由。username は identity、
+                           password は store の PAT)
+  url.<https>.insteadOf   SSH remote (ssh://git@<host>/ / git@<host>:) の
+                           ままでも HTTPS+PAT で push できるように書き換え
+  user.name / user.email  identity から
+  gpg.format=ssh / user.signingkey=key::<pub> / commit.gpgsign=true
+                           store の公開鍵で signed commit (秘密鍵はagent側)
+
+host は env GIT_AS_HOST、無ければ GLAB_AS_HOSTS (→ GLAB_ROTATE_HOSTS) の先頭。
+署名するには先に haj ssh-load --as <actor> [<ホスト>] で秘密鍵を agent に
+積んでおくこと (このコマンドは公開鍵しか読まない)。
+
+haj git --seed --as <actor>: stdin の name=/email=/username= 行 (KEY=VALUE・
+1行1組) を identity (agents/<actor>/identity) へ格納する (種蒔き)。3つ
+すべてが揃わないと何も書かない。既存値があれば拒否する — 上書きは --force。
+EOF
+    exit 0 ;;
+  --haj-complete)
+    printf '@delegate\tgit\n'
+    exit 0 ;;
+  --haj-env)
+    printf '%s\n' \
+      "GIT_AS_HOST=${GIT_AS_HOST:-}" \
+      "# 未設定なら GLAB_AS_HOSTS → GLAB_ROTATE_HOSTS の先頭 (実効値は表示しない)"
+    exit 0 ;;
+esac
+
+# --as / --seed はコマンド名直後のフラグ。このコマンドに無印は無い — actor は必須
+actor=""
+seed=""
+force=""
+case "${1:-}" in
+  --seed)
+    seed=1
+    shift
+    # --seed には git 引数が続かない (stdin から identity を読むだけ) ので、
+    # 残りのトークンを --as/--force の任意順で拾う
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --as) shift; actor="${1:-}"; shift || : ;;
+        --force) force=1; shift ;;
+        *) shift ;;
+      esac
+    done
+    ;;
+  --as)
+    shift
+    actor="${1:-}"
+    shift || :
+    ;;
+esac
+
+case "$actor" in
+  '')
+    if [ -n "$seed" ]; then
+      echo "git --seed: --as <actor> が必須です (使い方: haj git --seed --as <actor>)" >&2
+    else
+      echo "git: --as <actor> が必須です (使い方: haj git --as <actor> <gitの引数...>)" >&2
+    fi
+    exit 1 ;;
+  --*|*[!a-z0-9-]*)
+    echo "git --as: actor 名 ([a-z0-9-]+) が要ります: '${actor}'" >&2
+    exit 1 ;;
+esac
+
+if [ -n "$seed" ]; then
+  name="" ; email="" ; username=""
+  name_set="" ; email_set="" ; username_set=""
+  # #14: 末尾改行なしの最終行も読む (|| [ -n "$k" ] で EOF 直前の未改行行を拾う)
+  while IFS='=' read -r k v || [ -n "$k" ]; do
+    case "$k" in
+      name)
+        [ -n "$v" ] || { echo "git --seed: name の値が空です (name=... の形で)" >&2; exit 1; }
+        name="$v"; name_set=1 ;;
+      email)
+        [ -n "$v" ] || { echo "git --seed: email の値が空です (email=... の形で)" >&2; exit 1; }
+        email="$v"; email_set=1 ;;
+      username)
+        [ -n "$v" ] || { echo "git --seed: username の値が空です (username=... の形で)" >&2; exit 1; }
+        username="$v"; username_set=1 ;;
+      '') ;;
+      *) echo "git --seed: 未知のキー '${k}' (name=/email=/username= のみ)" >&2; exit 1 ;;
+    esac
+  done
+  # #14: name/email/username の3つすべてが揃わなければ何も書かずに fail-fast
+  # (部分成功を作らない)
+  if [ -z "$name_set" ] || [ -z "$email_set" ] || [ -z "$username_set" ]; then
+    echo "git --seed: name=/email=/username= の3つすべてが必要です (揃うまで何も書きません)" >&2
+    exit 1
+  fi
+  haj store status >/dev/null 2>&1 || haj store login >&2
+  # #1: 既存値があれば --force 無しには上書きしない (3フィールドを同じ規約で見る)
+  if [ -z "$force" ]; then
+    exists=""
+    haj store get "agents/${actor}/identity/name"     >/dev/null 2>&1 && exists=1
+    haj store get "agents/${actor}/identity/email"    >/dev/null 2>&1 && exists=1
+    haj store get "agents/${actor}/identity/username" >/dev/null 2>&1 && exists=1
+    if [ -n "$exists" ]; then
+      echo "git --seed: ${actor}: identity は既にあります。上書きは --force (使い方: haj git --seed --force --as ${actor})" >&2
+      exit 1
+    fi
+  fi
+  force_flag=""
+  [ -z "$force" ] || force_flag="--force"
+  ok=1
+  printf '%s' "$name"     | haj store put $force_flag "agents/${actor}/identity/name"     || ok=0
+  printf '%s' "$email"    | haj store put $force_flag "agents/${actor}/identity/email"    || ok=0
+  printf '%s' "$username" | haj store put $force_flag "agents/${actor}/identity/username" || ok=0
+  [ "$ok" = 1 ] || {
+    echo "git --seed: ${actor}: identity の store 書き込みに一部失敗しました" >&2
+    exit 1
+  }
+  echo "==> ${actor}: identity を種蒔きしました"
+  exit 0
+fi
+
+host="${GIT_AS_HOST:-${GLAB_AS_HOSTS:-${GLAB_ROTATE_HOSTS:-}}}"
+host="${host%% *}"
+if [ -z "$host" ]; then
+  echo "git --as: ホストが決まりません。GIT_AS_HOST か GLAB_AS_HOSTS/GLAB_ROTATE_HOSTS を設定してください" >&2
+  exit 1
+fi
+
+haj store status >/dev/null 2>&1 || haj store login >&2
+
+username=$(haj store get "agents/${actor}/identity/username") || {
+  echo "git --as: ${actor}: identity/username を store から読めません。種蒔きは:" >&2
+  echo "  printf 'name=...\\nemail=...\\nusername=...\\n' | haj git --seed --as ${actor}" >&2
+  exit 1
+}
+name=$(haj store get "agents/${actor}/identity/name") || {
+  echo "git --as: ${actor}: identity/name を store から読めません" >&2
+  exit 1
+}
+email=$(haj store get "agents/${actor}/identity/email") || {
+  echo "git --as: ${actor}: identity/email を store から読めません" >&2
+  exit 1
+}
+token=$(haj store get "agents/${actor}/gitlab-pat/${host}/token") || {
+  echo "git --as: ${actor}/${host}: gitlab-pat を store から読めません。種蒔きは:" >&2
+  echo "  haj glab-rotate --seed --as ${actor} ${host} < <PATファイル>" >&2
+  exit 1
+}
+pub=$(haj store get "agents/${actor}/ssh-signing/${host}/pub") || {
+  echo "git --as: ${actor}/${host}: ssh-signing の pub を store から読めません。種蒔きは:" >&2
+  echo "  haj ssh-load --seed --as ${actor} ${host} < <秘密鍵ファイル>" >&2
+  exit 1
+}
+
+# credential helper はメモリ上の env を読むだけ (ディスク非経由)。
+# 展開後の値は子プロセスの環境に見える (SPEC §10.11 の一般的な限界と同じ)
+export GIT_AS_USERNAME="$username"
+export GIT_AS_PASSWORD="$token"
+helper='!f() { [ "$1" = get ] || exit 0; printf "username=%s\npassword=%s\n" "$GIT_AS_USERNAME" "$GIT_AS_PASSWORD"; }; f'
+
+exec git \
+  -c "credential.helper=" \
+  -c "credential.helper=${helper}" \
+  -c "url.https://${host}/.insteadOf=ssh://git@${host}/" \
+  -c "url.https://${host}/.insteadOf=git@${host}:" \
+  -c "user.name=${name}" \
+  -c "user.email=${email}" \
+  -c gpg.format=ssh \
+  -c "user.signingkey=key::${pub}" \
+  -c commit.gpgsign=true \
+  "$@"

@@ -31,6 +31,56 @@ haj secret list --tree haj-credless      # 宣言の目録
 haj secret check --tree haj-credless     # 参照の検証 (vault には触らない)
 ```
 
+## アクター切替 (`--as` / `--seed`) — service account 名義
+
+個人名義 (hajime) のほかに、GitLab の service account (`yashiro-worker` /
+`yashiro-reviewer` / `yashiro-supervisor` 等) を名乗って `glab` / `git` を
+使い分ける仕組み (行為者分離。設計正本は館の
+`report/design-agent-actors`)。対象は `glab` / `glab-rotate` / `ssh-load` /
+`git` の4コマンドで、`--as <actor>` はどれもコマンド名直後のフラグ。
+
+- actor 名は `[a-z0-9-]+`(1文字以上)。それ以外は即エラー
+- 個人名義の宣言 (`tree.*.template.GLAB_CONFIG` / `GLAB_ROTATE_VAULT` /
+  `SSH_LOAD_VAULT` 等) には一切触れない — `--as` 無しの挙動は変わらない
+- actor の秘密は store の名前空間に置く (ツリーの `store://` — SPEC §10.7)。
+  論理レイアウト:
+
+  ```
+  agents/<actor>/gitlab-pat/<host>/token       PAT (glab-rotate --seed で種蒔き)
+  agents/<actor>/ssh-signing/<host>/key + /pub 署名鍵ペア (ssh-load --seed で種蒔き)
+  agents/<actor>/identity/name|email|username  git commit の名義 (git --seed で種蒔き)
+  ```
+
+- `haj store put` はツリーのコマンドの中でしか動かない (素のシェルから
+  `store://` は叩けない) ので、初回投入は各コマンドの **`--seed` の口**
+  (stdin → store) を使う。値は echo しない — 履歴に残らない・複数行が
+  成立するファイルリダイレクト (`< <ファイル>`) か、端末で `read` して
+  パイプする形にする
+- **`--seed` は既存値があると拒否する** (fail-fast)。上書き
+  (失効時の再種蒔き等) は `--force` を付ける。`ssh-load --seed` の
+  key/pub、`git --seed` の name/email/username は、いずれか1つでも
+  既存なら `--force` 無しでは全体を拒否する (片肺状態からでも
+  `--force` で全部を再投入できる)
+- 対象ホストの列挙は `GLAB_AS_HOSTS` (空白区切り。`glab` / `glab-rotate --as` /
+  `ssh-load` / `git` が使う)。未設定なら既存の `GLAB_ROTATE_HOSTS` を流用する:
+
+  ```sh
+  haj config set tree.haj-credless.env.GLAB_AS_HOSTS 'gitlab.example.com'
+  ```
+
+- 種蒔きの順序 (1 actor・1 host ぶん):
+
+  ```sh
+  haj glab-rotate --seed --as worker gitlab.example.com < <PATファイル>
+  haj ssh-load    --seed --as worker gitlab.example.com < <秘密鍵ファイル>
+  printf 'name=yashiro-worker\nemail=worker@example.com\nusername=yashiro-worker\n' \
+    | haj git --seed --as worker
+  ```
+
+  (すでに値がある場合は `--seed --force` で入れ直す)。以後は
+  `haj glab --as worker ...` / `haj glab-rotate --as worker` /
+  `haj ssh-load --as worker` / `haj git --as worker <gitの引数...>`。
+
 ## glab
 
 `tree.<インストール名>.template.GLAB_CONFIG` に tpl のパスを宣言する
@@ -55,6 +105,19 @@ hosts:
 
 `haj glab ...` は `haj secret tmpdir glab` (tmpfs・0700・セッション寿命) に
 config.yml をレンダリングし、`GLAB_CONFIG_DIR` を据えて glab を exec する。
+
+### actor 名義 (`--as`)
+
+```sh
+haj glab --as worker mr create ...
+```
+
+テンプレート宣言は使わない — `haj secret tmpdir glab-<actor>` に
+config.yml を**コマンド内で**生成し、`GLAB_AS_HOSTS` (→ `GLAB_ROTATE_HOSTS`)
+の各ホストの PAT を `agents/<actor>/gitlab-pat/<host>/token` から引く
+(HTTPS 固定。上のアクター切替の節を参照)。環境の `GLAB_CONFIG_DIR` は
+**無視する** — 無印の「env が既にあればそれが勝つ」規約はここには適用
+しない。actor 用の config は毎回必ず作り直す。
 
 ### 期限切れ前のローテーション (glab-rotate)
 
@@ -93,6 +156,28 @@ haj glab-rotate --force gitlab.example.com   # そのホストだけ今すぐ回
 - rotate 済みの旧トークンを使うと GitLab は再利用検知で**新トークンごと**
   ファミリー失効させる。`haj glab` は毎回レンダリングするので通常は無縁だが、
   `GLAB_CONFIG_DIR` を export したまま生かしている古いシェルからは叩かないこと。
+
+### actor 名義 (`--as` / `--seed`)
+
+margin/ttl/退避/独立処理の意味論は無印と同一で、PAT の読み書き先だけ
+`agents/<actor>/gitlab-pat/<host>/token`(store)に切り替わる。
+`GLAB_ROTATE_VAULT` は使わない。ホスト解決は
+**引数 → `GLAB_AS_HOSTS` → `GLAB_ROTATE_HOSTS`** の順 (無印は引数 →
+`GLAB_ROTATE_HOSTS` のまま)。
+
+```sh
+haj glab-rotate --seed --as worker gitlab.example.com < <PATファイル>   # 初回投入 (1ホストのみ)
+haj glab-rotate --as worker                                             # 以後の self-rotate (冪等)
+haj glab-rotate --as worker --check gitlab.example.com
+```
+
+store への書き戻しに失敗したとき (旧トークンは既に失効・新トークンは
+tmpfs に退避済み) の復旧も `--seed --force` の口を使う (素のシェルから
+`haj store put` は叩けないため):
+
+```sh
+haj glab-rotate --seed --force --as worker gitlab.example.com < <退避ファイル>
+```
 
 ## gh
 
@@ -250,6 +335,56 @@ bao kv put users/<自分>/ssh-keys mykey=@/path/to/id_rsa another=@...
 bao セッションが無ければ **haj コアの自動ログイン連鎖**が確保する
 (token lookup → `secrets.vault_cert_login` の cert 認証 → `secrets.vault_login`
 の OIDC。`haj docs secrets`)。ツリーは認証手順を知らない。
+
+### actor 名義 (`--as` / `--seed`)
+
+```sh
+haj ssh-load --seed --as worker gitlab.example.com < <秘密鍵ファイル>   # 種蒔き (key + pub を導出)
+haj ssh-load --as worker                                                 # ホスト省略時は GLAB_AS_HOSTS の先頭
+haj ssh-load --as worker gitlab.other.com
+```
+
+鍵は `agents/<actor>/ssh-signing/<host>` の `key` (秘密鍵) / `pub` (公開鍵)。
+`--seed` は stdin から OpenSSH 秘密鍵を1本読み、`ssh-keygen -y` で公開鍵を
+導出して両方を store に格納する (`ssh-keygen -y` はファイルでしか読めない
+ため tmpfs に一時実体化し、使用後に消す)。`--as` (無印load) は `key` を
+パイプで `ssh-add` に渡すだけでディスクを経由しない。
+
+## git — actor 名義で commit・push する
+
+`haj git` は `--as` 専用のコマンド (個人名義の「無印」は無い — 個人の git は
+そのまま素の `git` を使う)。commit の author/email・push の資格情報
+(HTTPS+PAT)・commit 署名 (ssh) を `-c` でその場だけ差し替えて `exec git` する
+(常駐する設定変更は無い)。
+
+```sh
+haj git --seed --as worker <<'EOF'
+name=yashiro-worker
+email=worker@example.com
+username=yashiro-worker
+EOF
+
+haj git --as worker push origin HEAD          # SSH remote のままでも HTTPS+PAT で押せる
+haj git --as worker commit -m '...'            # signed commit (ssh 署名鍵は先に ssh-load --as で agent へ)
+```
+
+`--seed` は name/email/username の**3つすべて**が揃わないと何も書かない
+(部分成功を作らない)。既存の identity があれば `--force` 無しには拒否する。
+
+- **credential**: 先頭に `-c credential.helper=`(空値)を注入して既存の
+  helper 連鎖をいったんリセットしてから、インラインの `!` helper を足す
+  (`~/.gitconfig` 等の他の helper が誤って併用されるのを防ぐ)。この
+  helper は `get` にだけ応答し、username/password を渡す (ディスクに
+  書かない。値は環境変数経由なので子プロセスの `/proc/<pid>/environ`
+  からは見える — SPEC §10.11 と同じ限界)
+- **URL 書き換え**: `url.https://<host>/.insteadOf` を `ssh://git@<host>/` と
+  `git@<host>:` の両形に張るので、remote が SSH のままでも HTTPS+PAT で通る
+- **署名**: `user.signingkey` は store の公開鍵を `key::` 直値で渡す
+  (ディスク非経由)。秘密鍵は `haj ssh-load --as` で agent 側に積んでおく
+  (このコマンドは公開鍵しか読まない)
+- host は env `GIT_AS_HOST`、無ければ `GLAB_AS_HOSTS` → `GLAB_ROTATE_HOSTS`
+  の先頭。identity (`name`/`email`/`username`) と gitlab-pat・ssh-signing の
+  `pub` は全部揃っていないと動かない (揃え方は上のアクター切替の節)
 
 ## kubectl は見送り
 
